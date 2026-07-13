@@ -132,6 +132,32 @@ class BinanceMarketDataAdapter:
         return candles
 
     # ------------------------------------------------------------------
+    # Order book
+    # ------------------------------------------------------------------
+
+    DEPTH_ENDPOINT = "/api/v3/depth"
+
+    def fetch_order_book(self, symbol: str, depth: int = 5) -> "OrderBookSnapshot":
+        """Fetch the current order book from Binance public endpoint."""
+        from playground.domain.market import OrderBookSnapshot, Symbol
+        url = (
+            f"{self._base_url}{self.DEPTH_ENDPOINT}"
+            f"?symbol={self.normalize_symbol(symbol)}&limit={depth}"
+        )
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        bids = tuple((float(b[0]), float(b[1])) for b in data.get("bids", []))
+        asks = tuple((float(a[0]), float(a[1])) for a in data.get("asks", []))
+        return OrderBookSnapshot(
+            symbol=Symbol(symbol),
+            timestamp=datetime.utcnow(),
+            bids=bids,
+            asks=asks,
+        )
+
+    # ------------------------------------------------------------------
     # Symbol normalization
     # ------------------------------------------------------------------
 

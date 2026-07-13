@@ -88,6 +88,9 @@ class ExecutionPipeline:
             })
             return decision
 
+        # Use provided current_price for risk sizing, fall back to entry_price
+        price_for_risk = current_price if current_price and current_price > 0 else (signal.entry_price or 0.0)
+
         # Estimate freshness/liquidity metrics
         spread_pct = order_book.spread_pct if order_book else 0.0
         # BUY orders consume asks; use ask depth for liquidity validation
@@ -97,10 +100,10 @@ class ExecutionPipeline:
         )
         slippage = self._estimate_slippage(order_book)
 
-        # Run risk evaluation
+        # Run risk evaluation with current market price
         decision = self._risk.evaluate(
             signal=signal,
-            current_price=signal.entry_price or 0.0,
+            current_price=price_for_risk,
             spread_pct=spread_pct,
             market_depth_usdt=depth,
             estimated_slippage_pct=slippage,

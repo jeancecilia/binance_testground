@@ -181,6 +181,8 @@ class TradingEngine:
                             extra={"unresolved": result.unresolved},
                         )
                         return
+                # Load persisted positions into risk engine after reconciliation
+                self._load_positions_after_reconciliation()
 
             # Run based on mode
             if self.config.mode == RuntimeMode.REPLAY:
@@ -242,7 +244,7 @@ class TradingEngine:
 
                 for candle in candles:
                     if isinstance(self.clock, ReplayClock):
-                        self.clock.advance_to(candle.open_time)
+                        self.clock.advance_to(candle.close_time)
 
                     context = self._process_candle_internal(sym, timeframe, candle)
                     if context:
@@ -323,8 +325,8 @@ class TradingEngine:
             # Strategy pipeline: evaluate strategies
             results = self.strategy_pipeline.evaluate(context)
 
-            # Build synthetic order-book snapshot for liquidity checks
-            order_book = self._build_synthetic_order_book(symbol, candle)
+            # Get order-book snapshot (mode-aware routing)
+            order_book = self._get_order_book(symbol, candle)
 
             # Execution pipeline: risk → order submission
             current_price = candle.close
@@ -346,27 +348,51 @@ class TradingEngine:
             )
             return None
 
-    def _build_synthetic_order_book(self, symbol: str, candle):
-        """Build a synthetic order book from candle data for liquidity checks.
+    def _get_order_book(self, symbol: str, candle):
+        """Get order book snapshot, routing per runtime mode.
 
-        Uses the candle's high/low/close to estimate bid/ask levels.
-        This provides reasonable depth for replay and shadow modes.
+        - Replay: synthetic order book derived from candle data
+        - Shadow: attempt real Binance depth; fall back to synthetic
+        - Testnet: real Binance depth only; fail closed if unavailable
         """
         from playground.domain.market import Symbol, OrderBookSnapshot
+
+        if self.config.mode == RuntimeMode.REPLAY:
+            return self._build_synthetic_order_book(symbol, candle)
+
+        if self.config.mode == RuntimeMode.TESTNET:
+            # Testnet: real depth only
+            if isinstance(self.market_source, BinanceMarketDataAdapter):
+                try:
+                    return self.market_source.fetch_order_book(symbol, depth=5)
+                except Exception as e:
+                    logger.error(
+                        f"Testnet order book unavailable — failing closed: {e}",
+                        extra={"symbol": symbol},
+                    )
+                    return None
+            logger.error("Testnet mode requires BinanceMarketDataAdapter for order book")
+            return None
+
+        # Shadow: try real, fall back to synthetic
+        if isinstance(self.market_source, BinanceMarketDataAdapter):
+            try:
+                return self.market_source.fetch_order_book(symbol, depth=5)
+            except Exception:
+                pass
+        return self._build_synthetic_order_book(symbol, candle)
+
+    @staticmethod
+    def _build_synthetic_order_book(symbol: str, candle):
+        """Build a synthetic order book from candle data for replay."""
+        from playground.domain.market import Symbol, OrderBookSnapshot
         mid = candle.close
-        spread = max(mid * 0.0005, 0.01)  # 0.05% minimum spread
+        spread = max(mid * 0.0005, 0.01)
         best_bid = mid - spread / 2
         best_ask = mid + spread / 2
 
-        # Build 5 levels of synthetic depth
-        bids = tuple(
-            (best_bid - i * spread * 0.5, candle.volume * 0.2)
-            for i in range(5)
-        )
-        asks = tuple(
-            (best_ask + i * spread * 0.5, candle.volume * 0.2)
-            for i in range(5)
-        )
+        bids = tuple((best_bid - i * spread * 0.5, candle.volume * 0.2) for i in range(5))
+        asks = tuple((best_ask + i * spread * 0.5, candle.volume * 0.2) for i in range(5))
         return OrderBookSnapshot(
             symbol=Symbol(symbol),
             timestamp=candle.close_time,
@@ -375,17 +401,25 @@ class TradingEngine:
         )
 
     def _sync_positions_to_risk_engine(self):
-        """Sync broker positions into the risk engine after execution."""
-        if self.broker is None:
-            return
+        """Sync positions into the risk engine from broker or database."""
         positions = {}
-        if hasattr(self.broker, 'get_all_positions'):
-            from playground.replay.simulated_broker import SimulatedBroker
-            if isinstance(self.broker, SimulatedBroker):
-                for sym, pos in self.broker.get_all_positions().items():
-                    positions[sym] = pos
+        # Simulated broker: in-memory positions
+        from playground.replay.simulated_broker import SimulatedBroker
+        if isinstance(self.broker, SimulatedBroker):
+            for sym, pos in self.broker.get_all_positions().items():
+                positions[sym] = pos
+        # Testnet / shadow: load from database
+        if not positions:
+            db_positions = self.repository.get_all_positions()
+            for pos in db_positions:
+                if pos.is_open:
+                    positions[pos.symbol] = pos
         if positions:
             self.risk_engine.update_positions(positions)
+
+    def _load_positions_after_reconciliation(self):
+        """After reconciliation, load persisted positions into the risk engine."""
+        self._sync_positions_to_risk_engine()
 
 
 # ------------------------------------------------------------------

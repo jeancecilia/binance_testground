@@ -99,7 +99,15 @@ class ReconciliationEngine:
                 result.repairs = repairs_done
                 result.unresolved = unresolved
 
-            # Step 9: Block orders if unresolved issues remain
+            # Step 9: Block orders if unresolved issues remain OR any order is UNKNOWN
+            local_unknowns = [
+                o for o in local_orders
+                if o.status in {OrderStatus.UNKNOWN, OrderStatus.PENDING_RECONCILIATION}
+            ]
+            if local_unknowns:
+                result.unresolved.append(
+                    f"{len(local_unknowns)} local order(s) are UNKNOWN — must reconcile before trading"
+                )
             if result.unresolved:
                 result.success = False
                 result.can_submit_orders = False
@@ -146,11 +154,10 @@ class ReconciliationEngine:
             if cid:
                 exchange_by_client_id[cid] = eo
 
-        # Local orders not on exchange
+        # Local orders not on exchange — flag ALL missing orders
         for cid, local in local_by_client_id.items():
             if cid not in exchange_by_client_id:
-                if local.status in {OrderStatus.PENDING, OrderStatus.SUBMITTED}:
-                    mismatches.append(f"Local order {cid} ({local.status.value}) not found on exchange")
+                mismatches.append(f"Local order {cid} ({local.status.value}) not found on exchange")
 
         # Exchange orders not locally
         for cid, exch in exchange_by_client_id.items():
