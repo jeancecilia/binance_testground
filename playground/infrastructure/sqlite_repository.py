@@ -670,10 +670,16 @@ class SQLiteRepository:
             return None
         return self._row_to_order(row)
 
-    def get_open_orders(self) -> list[BrokerOrder]:
-        rows = self.conn.execute(
-            "SELECT * FROM orders WHERE status IN ('PENDING','SUBMITTED','ACCEPTED','PARTIALLY_FILLED','UNKNOWN','PENDING_RECONCILIATION')"
-        ).fetchall()
+    def get_open_orders(self, symbol: str | None = None) -> list[BrokerOrder]:
+        if symbol:
+            rows = self.conn.execute(
+                "SELECT * FROM orders WHERE status IN ('PENDING','SUBMITTED','ACCEPTED','PARTIALLY_FILLED','UNKNOWN','PENDING_RECONCILIATION') AND symbol = ?",
+                (symbol,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM orders WHERE status IN ('PENDING','SUBMITTED','ACCEPTED','PARTIALLY_FILLED','UNKNOWN','PENDING_RECONCILIATION')"
+            ).fetchall()
         return [self._row_to_order(r) for r in rows]
 
     @staticmethod

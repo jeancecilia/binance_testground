@@ -66,8 +66,8 @@ class ReconciliationEngine:
         """
         result = ReconciliationResult(success=True)
 
-        # Step 1-2: Load local state
-        local_orders = self._repo.get_open_orders()
+        # Step 1-2: Load local state for this symbol only
+        local_orders = self._repo.get_open_orders(symbol)
         local_positions = {p.symbol: p for p in self._repo.get_all_positions()}
         result.local_order_count = len(local_orders)
 
@@ -99,14 +99,20 @@ class ReconciliationEngine:
                 result.repairs = repairs_done
                 result.unresolved = unresolved
 
-            # Step 9: Block orders if unresolved issues remain OR any order is UNKNOWN
-            local_unknowns = [
-                o for o in local_orders
+            # Step 8b: Reconstruct positions from Binance account data
+            self._reconstruct_positions_from_binance(
+                symbol, account_info, exchange_trades,
+            )
+
+            # Step 9: Re-query DB for UNKNOWN orders after repairs
+            refreshed = self._repo.get_open_orders(symbol)
+            remaining_unknowns = [
+                o for o in refreshed
                 if o.status in {OrderStatus.UNKNOWN, OrderStatus.PENDING_RECONCILIATION}
             ]
-            if local_unknowns:
+            if remaining_unknowns:
                 result.unresolved.append(
-                    f"{len(local_unknowns)} local order(s) are UNKNOWN — must reconcile before trading"
+                    f"{len(remaining_unknowns)} order(s) are UNKNOWN after repairs — trading blocked"
                 )
             if result.unresolved:
                 result.success = False
@@ -311,3 +317,78 @@ class ReconciliationEngine:
                 unresolved.append(mismatch)
 
         return repairs, unresolved
+
+    # ------------------------------------------------------------------
+    # Position reconstruction from Binance
+    # ------------------------------------------------------------------
+
+    def _reconstruct_positions_from_binance(
+        self, symbol: str, account_info: dict, trades: list[dict],
+    ) -> None:
+        """Reconstruct local positions from Binance account balances and trades.
+
+        This is the authoritative source for Testnet position state.
+        """
+        from datetime import datetime
+
+        norm_symbol = symbol.replace("/", "").replace("-", "")
+
+        # Parse account balances
+        balances = account_info.get("balances", [])
+        base_asset = ""
+        quote_asset = ""
+        for common_quote in ["USDT", "USDC", "BUSD", "BTC", "ETH"]:
+            if norm_symbol.endswith(common_quote):
+                base_asset = norm_symbol[:-len(common_quote)]
+                quote_asset = common_quote
+                break
+
+        if not base_asset:
+            return
+
+        base_balance = 0.0
+        for b in balances:
+            if b.get("asset") == base_asset:
+                base_balance = float(b.get("free", 0)) + float(b.get("locked", 0))
+                break
+
+        # Calculate average entry from recent fills
+        total_cost = 0.0
+        total_qty = 0.0
+        total_commission = 0.0
+        for trade in trades:
+            if trade.get("symbol") in (norm_symbol, symbol):
+                qty = float(trade.get("qty", 0))
+                price = float(trade.get("price", 0))
+                commission = float(trade.get("commission", 0))
+                total_cost += qty * price
+                total_qty += qty
+                total_commission += commission
+
+                # Persist fills
+                fill = Fill(
+                    fill_id=str(trade.get("id", "")),
+                    order_id=str(trade.get("orderId", "")),
+                    client_order_id=trade.get("clientOrderId", ""),
+                    symbol=symbol,
+                    side=OrderSide.BUY if trade.get("isBuyer") else OrderSide.SELL,
+                    quantity=qty,
+                    price=price,
+                    commission=commission,
+                    commission_asset=trade.get("commissionAsset", ""),
+                    filled_at=datetime.utcfromtimestamp(
+                        trade.get("time", 0) / 1000.0
+                    ),
+                )
+                self._repo.insert_fill(fill)
+
+        # Upsert position
+        if abs(base_balance) > 1e-10:
+            avg_price = total_cost / total_qty if total_qty > 0 else 0.0
+            position = Position(
+                symbol=symbol,
+                quantity=base_balance,
+                avg_entry_price=avg_price,
+                total_commission=total_commission,
+            )
+            self._repo.upsert_position(position)

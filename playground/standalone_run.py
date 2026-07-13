@@ -329,7 +329,12 @@ class TradingEngine:
             order_book = self._get_order_book(symbol, candle)
 
             # Execution pipeline: risk → order submission
-            current_price = candle.close
+            # Use best ask for BUY sizing when order book is available
+            current_price = (
+                order_book.best_ask
+                if order_book and order_book.best_ask > 0
+                else candle.close
+            )
             for strategy, result in results:
                 if hasattr(result, 'signal_id') and not hasattr(result, 'reason'):
                     decision = self.execution_pipeline.process_signal(
