@@ -1,22 +1,9 @@
-"""Risk engine: validates every signal before execution.
-
-Minimum controls:
-- Max open positions / positions per symbol
-- Max exposure per symbol / total exposure
-- Position sizing
-- Max daily loss / max drawdown
-- Entry cooldown
-- Max spread / min depth / max slippage
-- One entry per strategy per candle
-- Kill switch
-
-Every signal results in either an approved RiskDecision or a persisted rejection.
-"""
+"""Risk engine between strategy evaluation and execution."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence
+from typing import Dict
 
 from playground.domain.orders import RiskDecision
 from playground.domain.positions import Position
@@ -26,10 +13,7 @@ from playground.infrastructure.system_clock import Clock, SystemClock
 
 
 class RiskEngine:
-    """Independent risk engine between strategy evaluation and execution.
-
-    Strategies must never call the broker directly.
-    """
+    """Evaluate signals against position, exposure, loss, and liquidity limits."""
 
     def __init__(
         self,
@@ -38,17 +22,23 @@ class RiskEngine:
         daily_pnl: float = 0.0,
         active_signal_ids: set[str] | None = None,
         clock: Clock | None = None,
+        market_prices: Dict[str, float] | None = None,
     ) -> None:
         self.config = config or RiskEngineConfig()
-        self._positions: Dict[str, Position] = positions or {}
+        self._positions: Dict[str, Position] = {
+            symbol: position
+            for symbol, position in (positions or {}).items()
+            if position.is_open
+        }
         self._daily_pnl = daily_pnl
         self._last_entry_time: Dict[str, datetime] = {}
         self._active_signal_ids: set[str] = active_signal_ids or set()
         self._clock = clock or SystemClock()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._market_prices: Dict[str, float] = {
+            symbol: price
+            for symbol, price in (market_prices or {}).items()
+            if price > 0
+        }
 
     def evaluate(
         self,
@@ -58,118 +48,153 @@ class RiskEngine:
         market_depth_usdt: float = 0.0,
         estimated_slippage_pct: float = 0.0,
     ) -> RiskDecision:
-        """Evaluate a strategy signal against all risk controls.
-
-        Returns RiskDecision with approved=True/False and detailed results.
-        """
+        """Evaluate a signal and return an approval or structured rejection."""
         checks_passed: list[str] = []
         checks_failed: list[str] = []
 
-        # 1. Kill switch
+        if current_price > 0:
+            self.update_market_price(signal.symbol, current_price)
+
         if self.config.kill_switch:
             checks_failed.append("kill_switch_engaged")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.KILL_SWITCH_ENGAGED,
             )
 
-        # 2. One entry per strategy per candle
         if str(signal.signal_id) in self._active_signal_ids:
             checks_failed.append("duplicate_signal")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.DUPLICATE_SIGNAL,
             )
         checks_passed.append("unique_signal")
 
-        # 3. Max open positions
-        open_positions = sum(1 for p in self._positions.values() if p.is_open)
+        open_positions = sum(1 for position in self._positions.values() if position.is_open)
         if open_positions >= self.config.max_open_positions:
             checks_failed.append("max_open_positions")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.MAX_OPEN_POSITIONS_REACHED,
             )
         checks_passed.append("open_positions_ok")
 
-        # 4. Max positions per symbol
         symbol_positions = sum(
-            1 for s, p in self._positions.items()
-            if p.is_open and s == signal.symbol
+            1
+            for symbol, position in self._positions.items()
+            if position.is_open and symbol == signal.symbol
         )
         if symbol_positions >= self.config.max_positions_per_symbol:
             checks_failed.append("max_positions_per_symbol")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.MAX_POSITIONS_PER_SYMBOL_REACHED,
             )
         checks_passed.append("positions_per_symbol_ok")
 
-        # 5. Max exposure per symbol (include proposed position)
-        proposed_notional = (
-            signal.entry_price * self._calculate_position_size(current_price)
-            if signal.entry_price and current_price > 0
-            else 0.0
-        )
-        symbol_exposure = (
-            sum(
-                p.notional_value for s, p in self._positions.items()
-                if p.is_open and s == signal.symbol
+        position_size = self._calculate_position_size(current_price)
+        if position_size <= 0:
+            checks_failed.append("position_size_zero")
+            return self._make_decision(
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
+                SignalRejectionReason.POSITION_SIZE_ZERO,
             )
-            + proposed_notional
-        )
+
+        exposure = self._mark_to_market_exposure(signal.symbol, current_price)
+        if exposure is None:
+            missing = sorted(
+                position.symbol
+                for position in self._positions.values()
+                if position.is_open
+                and position.symbol != signal.symbol
+                and self._market_prices.get(position.symbol, 0.0) <= 0
+            )
+            checks_failed.extend(
+                f"missing_mark_price:{symbol}" for symbol in missing
+            )
+            return self._make_decision(
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
+                SignalRejectionReason.DATA_CONTINUITY_BROKEN,
+            )
+
+        existing_symbol_exposure, existing_total_exposure, total_unrealized = exposure
+        proposed_notional = current_price * position_size
+
         max_symbol_exposure = (
-            self.config.initial_balance_usdt * self.config.max_exposure_per_symbol_pct
+            self.config.initial_balance_usdt
+            * self.config.max_exposure_per_symbol_pct
         )
-        if symbol_exposure > max_symbol_exposure:
+        if existing_symbol_exposure + proposed_notional > max_symbol_exposure:
             checks_failed.append("max_exposure_per_symbol")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.MAX_EXPOSURE_PER_SYMBOL_REACHED,
             )
         checks_passed.append("exposure_per_symbol_ok")
 
-        # 6. Max total exposure (include proposed position)
-        total_exposure = (
-            sum(p.notional_value for p in self._positions.values() if p.is_open)
-            + proposed_notional
-        )
         max_total_exposure = (
-            self.config.initial_balance_usdt * self.config.max_total_exposure_pct
+            self.config.initial_balance_usdt
+            * self.config.max_total_exposure_pct
         )
-        if total_exposure > max_total_exposure:
+        if existing_total_exposure + proposed_notional > max_total_exposure:
             checks_failed.append("max_total_exposure")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.MAX_TOTAL_EXPOSURE_REACHED,
             )
         checks_passed.append("total_exposure_ok")
 
-        # 7. Max daily loss (only actual losses block trading)
         max_daily_loss = (
             self.config.initial_balance_usdt * self.config.max_daily_loss_pct
         )
         if self._daily_pnl < 0 and abs(self._daily_pnl) >= max_daily_loss:
             checks_failed.append("max_daily_loss")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.MAX_DAILY_LOSS_REACHED,
             )
         checks_passed.append("daily_loss_ok")
 
-        # 8. Max drawdown (check across all positions)
-        total_pnl = sum(p.unrealized_pnl for p in self._positions.values())
-        if total_pnl < 0:
-            drawdown_pct = abs(total_pnl) / self.config.initial_balance_usdt
+        if total_unrealized < 0:
+            drawdown_pct = abs(total_unrealized) / self.config.initial_balance_usdt
             if drawdown_pct > self.config.max_drawdown_pct:
                 checks_failed.append("max_drawdown")
                 return self._make_decision(
-                    signal, False, checks_passed, checks_failed,
+                    signal,
+                    False,
+                    checks_passed,
+                    checks_failed,
                     SignalRejectionReason.MAX_DRAWDOWN_REACHED,
                 )
         checks_passed.append("drawdown_ok")
 
-        # 9. Entry cooldown (uses injected clock for determinism)
         cooldown_key = f"{signal.strategy_id}:{signal.symbol}"
         last_entry = self._last_entry_time.get(cooldown_key)
         if last_entry is not None:
@@ -177,52 +202,50 @@ class RiskEngine:
             if elapsed < self.config.entry_cooldown_seconds:
                 checks_failed.append("entry_cooldown")
                 return self._make_decision(
-                    signal, False, checks_passed, checks_failed,
+                    signal,
+                    False,
+                    checks_passed,
+                    checks_failed,
                     SignalRejectionReason.ENTRY_COOLDOWN_ACTIVE,
                 )
         checks_passed.append("cooldown_ok")
 
-        # 10. Maximum spread
         if spread_pct > self.config.max_spread_pct:
             checks_failed.append("max_spread")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.SPREAD_TOO_WIDE,
             )
         checks_passed.append("spread_ok")
 
-        # 11. Minimum market depth
         if market_depth_usdt < self.config.min_market_depth_usdt:
             checks_failed.append("min_depth")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.INSUFFICIENT_DEPTH,
             )
         checks_passed.append("depth_ok")
 
-        # 12. Maximum estimated slippage
         if estimated_slippage_pct > self.config.max_estimated_slippage_pct:
             checks_failed.append("max_slippage")
             return self._make_decision(
-                signal, False, checks_passed, checks_failed,
+                signal,
+                False,
+                checks_passed,
+                checks_failed,
                 SignalRejectionReason.ESTIMATED_SLIPPAGE_TOO_HIGH,
             )
         checks_passed.append("slippage_ok")
-
-        # 13. Position sizing
-        position_size = self._calculate_position_size(current_price)
-        if position_size <= 0:
-            checks_failed.append("position_size_zero")
-            return self._make_decision(
-                signal, False, checks_passed, checks_failed,
-                SignalRejectionReason.POSITION_SIZE_ZERO,
-            )
         checks_passed.append("position_size_ok")
 
-        # All checks passed
         self._active_signal_ids.add(str(signal.signal_id))
         self._last_entry_time[cooldown_key] = self._clock.now()
-
         return RiskDecision(
             signal_id=str(signal.signal_id),
             strategy_id=signal.strategy_id,
@@ -236,30 +259,59 @@ class RiskEngine:
             checks_failed=tuple(checks_failed),
         )
 
-    # ------------------------------------------------------------------
-    # Position sizing
-    # ------------------------------------------------------------------
+    def _mark_to_market_exposure(
+        self, signal_symbol: str, current_price: float
+    ) -> tuple[float, float, float] | None:
+        symbol_exposure = 0.0
+        total_exposure = 0.0
+        total_unrealized = 0.0
+
+        for key, position in self._positions.items():
+            if not position.is_open:
+                continue
+            symbol = position.symbol or key
+            mark_price = (
+                current_price
+                if symbol == signal_symbol
+                else self._market_prices.get(symbol, 0.0)
+            )
+            if mark_price <= 0:
+                return None
+            market_value = abs(position.quantity) * mark_price
+            total_exposure += market_value
+            if symbol == signal_symbol:
+                symbol_exposure += market_value
+            total_unrealized += position.quantity * (
+                mark_price - position.avg_entry_price
+            )
+
+        return symbol_exposure, total_exposure, total_unrealized
 
     def _calculate_position_size(self, current_price: float) -> float:
-        """Calculate position size based on configured percentage of balance."""
         if current_price <= 0:
             return 0.0
-
-        # Simple fixed-fraction position sizing
-        allocation = self.config.initial_balance_usdt * self.config.position_size_pct
-        quantity = allocation / current_price
-        return quantity
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        allocation = (
+            self.config.initial_balance_usdt * self.config.position_size_pct
+        )
+        return allocation / current_price
 
     def update_positions(self, positions: Dict[str, Position]) -> None:
-        """Update the current positions snapshot."""
-        self._positions = positions
+        """Replace the full position snapshot, including clearing to empty."""
+        self._positions = {
+            symbol: position
+            for symbol, position in positions.items()
+            if position.is_open
+        }
+
+    def update_market_price(self, symbol: str, price: float) -> None:
+        if price > 0:
+            self._market_prices[symbol] = price
+
+    def update_market_prices(self, prices: Dict[str, float]) -> None:
+        for symbol, price in prices.items():
+            self.update_market_price(symbol, price)
 
     def update_daily_pnl(self, pnl: float) -> None:
-        """Update the current daily PnL."""
         self._daily_pnl = pnl
 
     @property
@@ -267,15 +319,13 @@ class RiskEngine:
         return self.config.kill_switch
 
     def engage_kill_switch(self) -> None:
-        """Dynamically engage the kill switch."""
-        object.__setattr__(self.config, 'kill_switch', True)
+        object.__setattr__(self.config, "kill_switch", True)
 
     def disengage_kill_switch(self) -> None:
-        """Dynamically disengage the kill switch."""
-        object.__setattr__(self.config, 'kill_switch', False)
+        object.__setattr__(self.config, "kill_switch", False)
 
-    @staticmethod
     def _make_decision(
+        self,
         signal: StrategySignal,
         approved: bool,
         checks_passed: list[str],
@@ -291,7 +341,7 @@ class RiskEngine:
             approved=approved,
             position_size=None if not approved else 0.0,
             rejection_reason=reason.value if reason else None,
-            risk_config_version="1.0.0",
+            risk_config_version=self.config.version,
             checks_passed=tuple(checks_passed),
             checks_failed=tuple(checks_failed),
         )
