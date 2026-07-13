@@ -1,33 +1,29 @@
-"""Order reconciliation: startup and periodic reconciliation.
-
-Startup sequence:
-1. Load the latest local checkpoint.
-2. Load locally known orders and positions.
-3. Fetch Testnet open orders.
-4. Fetch recent Testnet orders and fills.
-5. Fetch Testnet balances and positions.
-6. Compare local and exchange state.
-7. Repair recoverable local inconsistencies.
-8. Record unresolved mismatches.
-9. Block new order submission if reconciliation fails.
-10. Resume from the first unprocessed completed candle.
-"""
+"""Order reconciliation between local state and Binance Testnet."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Tuple
 
+from playground.domain.market import Symbol
 from playground.domain.orders import (
-    BrokerOrder, Fill, OrderSide, OrderStatus, OrderType,
+    BrokerOrder,
+    Fill,
+    OrderSide,
+    OrderStatus,
+    OrderType,
 )
 from playground.domain.positions import Position
 from playground.infrastructure.binance_testnet_broker import BinanceTestnetBroker
 from playground.infrastructure.sqlite_repository import SQLiteRepository
 
 logger = logging.getLogger(__name__)
+
+
+class PositionReconstructionError(RuntimeError):
+    """Raised when exchange history cannot explain the reported balance."""
 
 
 @dataclass
@@ -44,7 +40,7 @@ class ReconciliationResult:
 
 
 class ReconciliationEngine:
-    """Handles startup and periodic reconciliation between local state and Testnet."""
+    """Reconcile local orders, fills, and positions with Binance Testnet."""
 
     def __init__(
         self,
@@ -54,91 +50,84 @@ class ReconciliationEngine:
         self._repo = repository
         self._broker = broker
 
-    # ------------------------------------------------------------------
-    # Startup reconciliation
-    # ------------------------------------------------------------------
-
     def startup_reconcile(self, symbol: str) -> ReconciliationResult:
-        """Run the full startup reconciliation sequence.
-
-        Returns ReconciliationResult indicating success/failure and
-        whether new order submission is allowed.
-        """
+        """Run startup reconciliation for one internal symbol."""
         result = ReconciliationResult(success=True)
-
-        # Step 1-2: Load local state for this symbol only
-        local_orders = self._repo.get_open_orders(symbol)
-        local_positions = {p.symbol: p for p in self._repo.get_all_positions()}
+        internal_symbol = str(Symbol(symbol))
+        local_orders = self._repo.get_open_orders(internal_symbol)
         result.local_order_count = len(local_orders)
 
         if self._broker is None:
-            # No broker = shadow mode, reconciliation not needed
             result.can_submit_orders = False
             return result
 
         try:
-            # Step 3: Fetch Testnet open orders
-            exchange_open_orders = self._broker.get_open_orders(symbol)
+            exchange_open_orders = self._broker.get_open_orders(internal_symbol)
+            exchange_recent_orders = self._broker.get_recent_orders(
+                internal_symbol, limit=50
+            )
+            get_all_trades = getattr(self._broker, "get_all_trades", None)
+            if callable(get_all_trades):
+                exchange_trades = get_all_trades(internal_symbol)
+            else:
+                exchange_trades = self._broker.get_recent_trades(
+                    internal_symbol, limit=1000
+                )
+            account_info = self._broker.get_account_info()
             result.exchange_order_count = len(exchange_open_orders)
 
-            # Step 4: Fetch recent orders and fills
-            exchange_recent_orders = self._broker.get_recent_orders(symbol, limit=50)
-            exchange_trades = self._broker.get_recent_trades(symbol, limit=50)
-
-            # Step 5: Fetch Testnet account info
-            account_info = self._broker.get_account_info()
-
-            # Step 6-8: Compare and repair
-            mismatches = self._compare_orders(local_orders, exchange_open_orders, exchange_recent_orders)
+            mismatches = self._compare_orders(
+                local_orders, exchange_open_orders, exchange_recent_orders
+            )
             result.mismatches = mismatches
 
             if mismatches:
-                repairs_done, unresolved = self._attempt_repairs(
-                    mismatches, exchange_open_orders, exchange_recent_orders, exchange_trades,
+                repairs, unresolved = self._attempt_repairs(
+                    internal_symbol,
+                    mismatches,
+                    exchange_open_orders,
+                    exchange_recent_orders,
                 )
-                result.repairs = repairs_done
+                result.repairs = repairs
                 result.unresolved = unresolved
 
-            # Step 8b: Reconstruct positions from Binance account data
             self._reconstruct_positions_from_binance(
-                symbol, account_info, exchange_trades,
+                internal_symbol, account_info, exchange_trades
             )
 
-            # Step 9: Re-query DB for UNKNOWN orders after repairs
-            refreshed = self._repo.get_open_orders(symbol)
             remaining_unknowns = [
-                o for o in refreshed
-                if o.status in {OrderStatus.UNKNOWN, OrderStatus.PENDING_RECONCILIATION}
+                order
+                for order in self._repo.get_open_orders(internal_symbol)
+                if order.status
+                in {OrderStatus.UNKNOWN, OrderStatus.PENDING_RECONCILIATION}
             ]
             if remaining_unknowns:
                 result.unresolved.append(
-                    f"{len(remaining_unknowns)} order(s) are UNKNOWN after repairs — trading blocked"
+                    f"{len(remaining_unknowns)} order(s) remain UNKNOWN after "
+                    "reconciliation"
                 )
+
             if result.unresolved:
                 result.success = False
                 result.can_submit_orders = False
                 logger.error(
-                    "Reconciliation has unresolved mismatches — blocking order submission",
+                    "Reconciliation has unresolved mismatches; blocking orders",
                     extra={"unresolved": result.unresolved},
                 )
             else:
                 result.can_submit_orders = True
                 logger.info(
-                    "Reconciliation successful — order submission enabled",
+                    "Reconciliation successful; order submission enabled",
                     extra={"repairs": len(result.repairs)},
                 )
 
-        except Exception as e:
+        except Exception as exc:
             result.success = False
             result.can_submit_orders = False
-            result.unresolved.append(f"Reconciliation error: {e}")
-            logger.exception("Reconciliation failed with exception")
+            result.unresolved.append(f"Reconciliation error: {exc}")
+            logger.exception("Reconciliation failed")
 
         return result
-
-    # ------------------------------------------------------------------
-    # Comparison logic
-    # ------------------------------------------------------------------
 
     def _compare_orders(
         self,
@@ -146,249 +135,349 @@ class ReconciliationEngine:
         exchange_open: list[dict],
         exchange_recent: list[dict],
     ) -> list[str]:
-        """Compare local and exchange orders, return list of mismatch descriptions."""
+        """Compare local and exchange order state."""
         mismatches: list[str] = []
-
         local_by_client_id = {o.client_order_id: o for o in local_orders}
         exchange_by_client_id: Dict[str, dict] = {}
-        for eo in exchange_recent:
-            cid = eo.get("clientOrderId", "")
-            if cid:
-                exchange_by_client_id[cid] = eo
-        for eo in exchange_open:
-            cid = eo.get("clientOrderId", "")
-            if cid:
-                exchange_by_client_id[cid] = eo
 
-        # Local orders not on exchange — flag ALL missing orders
-        for cid, local in local_by_client_id.items():
-            if cid not in exchange_by_client_id:
-                mismatches.append(f"Local order {cid} ({local.status.value}) not found on exchange")
+        for order in exchange_recent + exchange_open:
+            client_id = order.get("clientOrderId", "")
+            if client_id:
+                exchange_by_client_id[client_id] = order
 
-        # Exchange orders not locally
-        for cid, exch in exchange_by_client_id.items():
-            if cid not in local_by_client_id:
-                mismatches.append(f"Exchange order {cid} not found locally")
-
-        # Status mismatches
-        for cid in set(local_by_client_id.keys()) & set(exchange_by_client_id.keys()):
-            local = local_by_client_id[cid]
-            exch = exchange_by_client_id[cid]
-            exch_status = exch.get("status", "")
-            status_map = {
-                "NEW": OrderStatus.ACCEPTED,
-                "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
-                "FILLED": OrderStatus.FILLED,
-                "CANCELED": OrderStatus.CANCELLED,
-                "REJECTED": OrderStatus.REJECTED,
-                "EXPIRED": OrderStatus.EXPIRED,
-            }
-            mapped = status_map.get(exch_status)
-            if mapped and local.status != mapped:
+        for client_id, local_order in local_by_client_id.items():
+            if client_id not in exchange_by_client_id:
                 mismatches.append(
-                    f"Status mismatch for {cid}: local={local.status.value}, exchange={exch_status}"
+                    f"Local order {client_id} ({local_order.status.value}) "
+                    "not found on exchange"
+                )
+
+        for client_id in exchange_by_client_id:
+            if client_id not in local_by_client_id:
+                mismatches.append(
+                    f"Exchange order {client_id} not found locally"
+                )
+
+        for client_id in set(local_by_client_id) & set(exchange_by_client_id):
+            local_order = local_by_client_id[client_id]
+            exchange_order = exchange_by_client_id[client_id]
+            exchange_status = self._map_status(exchange_order.get("status", ""))
+            if exchange_status is not None and local_order.status != exchange_status:
+                mismatches.append(
+                    f"Status mismatch for {client_id}: "
+                    f"local={local_order.status.value}, "
+                    f"exchange={exchange_order.get('status', '')}"
                 )
 
         return mismatches
 
-    # ------------------------------------------------------------------
-    # Repair logic
-    # ------------------------------------------------------------------
-
     def _attempt_repairs(
         self,
+        internal_symbol: str,
         mismatches: list[str],
         exchange_open: list[dict],
         exchange_recent: list[dict],
-        exchange_trades: list[dict],
     ) -> Tuple[list[str], list[str]]:
-        """Attempt to repair recoverable inconsistencies.
-
-        Returns (repairs_made, unresolved).
-        """
+        """Repair recoverable order inconsistencies."""
         repairs: list[str] = []
         unresolved: list[str] = []
+        exchange_orders = exchange_recent + exchange_open
 
         for mismatch in mismatches:
             if "not found on exchange" in mismatch:
-                # Local order not on exchange — mark as UNKNOWN
-                cid = mismatch.split(" ")[2]
-                existing = self._repo.get_order(cid)
+                client_id = mismatch.split(" ")[2]
+                existing = self._repo.get_order(client_id)
+                if existing is None:
+                    unresolved.append(mismatch)
+                    continue
                 self._repo.update_order_status(
-                    cid,
-                    existing.order_id if existing else "",
+                    client_id,
+                    existing.order_id,
                     OrderStatus.UNKNOWN,
-                    existing.executed_quantity if existing else 0.0,
-                    existing.cummulative_quote_qty if existing else 0.0,
+                    existing.executed_quantity,
+                    existing.cummulative_quote_qty,
                     existing.avg_price,
                     existing.price,
-                    {"reconciliation_note": "Order not found on exchange during reconciliation"},
+                    {
+                        "reconciliation_note": (
+                            "Order not found on exchange during reconciliation"
+                        )
+                    },
                 )
-                repairs.append(f"Marked local order {cid} as UNKNOWN (not on exchange)")
+                repairs.append(
+                    f"Marked local order {client_id} as UNKNOWN"
+                )
+                continue
 
-            elif "not found locally" in mismatch:
-                # Exchange has an order we don't know about
-                cid = mismatch.split(" ")[2]
-                exch_order = None
-                for eo in exchange_recent + exchange_open:
-                    if eo.get("clientOrderId") == cid:
-                        exch_order = eo
-                        break
+            if "not found locally" in mismatch:
+                client_id = mismatch.split(" ")[2]
+                exchange_order = self._find_exchange_order(
+                    client_id, exchange_orders
+                )
+                if exchange_order is None:
+                    unresolved.append(mismatch)
+                    continue
 
-                if exch_order:
-                    side = OrderSide.BUY if exch_order.get("side") == "BUY" else OrderSide.SELL
-                    order_type = OrderType.LIMIT if exch_order.get("type") == "LIMIT" else OrderType.MARKET
-                    status_map = {
-                        "NEW": OrderStatus.ACCEPTED,
-                        "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
-                        "FILLED": OrderStatus.FILLED,
-                        "CANCELED": OrderStatus.CANCELLED,
-                        "REJECTED": OrderStatus.REJECTED,
-                        "EXPIRED": OrderStatus.EXPIRED,
-                    }
-                    status = status_map.get(exch_order.get("status", ""), OrderStatus.UNKNOWN)
+                mapped = self._broker_order_from_exchange(
+                    internal_symbol, exchange_order
+                )
+                existing = self._repo.get_order(client_id)
+                if existing is not None:
+                    self._repo.update_order_status(
+                        client_id,
+                        mapped.order_id,
+                        mapped.status,
+                        mapped.executed_quantity,
+                        mapped.cummulative_quote_qty,
+                        mapped.avg_price,
+                        mapped.price,
+                        mapped.exchange_response,
+                    )
+                    repairs.append(
+                        f"Updated local order {client_id} from exchange data"
+                    )
+                elif self._repo.insert_order(mapped):
+                    repairs.append(
+                        f"Created local order {client_id} from exchange data"
+                    )
+                else:
+                    unresolved.append(
+                        f"Could not persist exchange order {client_id}"
+                    )
+                continue
 
-                    # Use upsert: update if local order exists (e.g. UNKNOWN), insert otherwise
-                    existing = self._repo.get_order(cid)
-                    if existing:
-                        self._repo.update_order_status(
-                            cid,
-                            str(exch_order.get("orderId", "")),
-                            status,
-                            float(exch_order.get("executedQty", 0)),
-                            float(exch_order.get("cummulativeQuoteQty", 0)),
-                            float(exch_order.get("price", 0)) if exch_order.get("price") else None,
-                            float(exch_order.get("price", 0)) if exch_order.get("price") else None,
-                            exch_order,
-                        )
-                        repairs.append(f"Updated local order {cid} from exchange data (was {existing.status.value})")
-                    else:
-                        broker_order = BrokerOrder(
-                            order_id=str(exch_order.get("orderId", "")),
-                            client_order_id=cid,
-                            symbol=exch_order.get("symbol", ""),
-                            side=side,
-                            order_type=order_type,
-                            quantity=float(exch_order.get("origQty", 0)),
-                            price=float(exch_order.get("price", 0)) if exch_order.get("price") else None,
-                            status=status,
-                            executed_quantity=float(exch_order.get("executedQty", 0)),
-                            cummulative_quote_qty=float(exch_order.get("cummulativeQuoteQty", 0)),
-                            exchange_response=exch_order,
-                        )
-                        self._repo.insert_order(broker_order)
-                        repairs.append(f"Created local order {cid} from exchange data")
-
-            elif "Status mismatch" in mismatch:
-                # Update local status to match exchange
-                parts = mismatch.split(": ")[1]
-                cid = parts.split(":")[0]
-                exch_status_str = parts.split("exchange=")[1]
-
-                status_map = {
-                    "NEW": OrderStatus.ACCEPTED,
-                    "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
-                    "FILLED": OrderStatus.FILLED,
-                    "CANCELED": OrderStatus.CANCELLED,
-                    "REJECTED": OrderStatus.REJECTED,
-                    "EXPIRED": OrderStatus.EXPIRED,
-                }
-                new_status = status_map.get(exch_status_str, OrderStatus.UNKNOWN)
-
-                exch_data = {}
-                for eo in exchange_recent + exchange_open:
-                    if eo.get("clientOrderId") == cid:
-                        exch_data = eo
-                        break
-
+            if "Status mismatch" in mismatch:
+                detail = mismatch.split(": ", 1)[1]
+                client_id = detail.split(":", 1)[0]
+                exchange_order = self._find_exchange_order(
+                    client_id, exchange_orders
+                )
+                if exchange_order is None:
+                    unresolved.append(mismatch)
+                    continue
+                mapped = self._broker_order_from_exchange(
+                    internal_symbol, exchange_order
+                )
                 self._repo.update_order_status(
-                    cid,
-                    str(exch_data.get("orderId", "")),
-                    new_status,
-                    float(exch_data.get("executedQty", 0)),
-                    float(exch_data.get("cummulativeQuoteQty", 0)),
-                    float(exch_data.get("price", 0)) if exch_data.get("price") else None,
-                    float(exch_data.get("price", 0)) if exch_data.get("price") else None,
-                    exch_data,
+                    client_id,
+                    mapped.order_id,
+                    mapped.status,
+                    mapped.executed_quantity,
+                    mapped.cummulative_quote_qty,
+                    mapped.avg_price,
+                    mapped.price,
+                    mapped.exchange_response,
                 )
-                repairs.append(f"Updated local order {cid} status to {new_status.value}")
+                repairs.append(
+                    f"Updated local order {client_id} to {mapped.status.value}"
+                )
+                continue
 
-            else:
-                unresolved.append(mismatch)
+            unresolved.append(mismatch)
 
         return repairs, unresolved
 
-    # ------------------------------------------------------------------
-    # Position reconstruction from Binance
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_exchange_order(
+        client_id: str, orders: list[dict]
+    ) -> dict | None:
+        for order in orders:
+            if order.get("clientOrderId") == client_id:
+                return order
+        return None
+
+    @classmethod
+    def _broker_order_from_exchange(
+        cls, internal_symbol: str, exchange_order: dict
+    ) -> BrokerOrder:
+        status = cls._map_status(exchange_order.get("status", ""))
+        if status is None:
+            status = OrderStatus.UNKNOWN
+        side = (
+            OrderSide.BUY
+            if exchange_order.get("side") == "BUY"
+            else OrderSide.SELL
+        )
+        order_type = (
+            OrderType.LIMIT
+            if exchange_order.get("type") == "LIMIT"
+            else OrderType.MARKET
+        )
+        executed_qty = float(exchange_order.get("executedQty", 0))
+        cumulative_quote = float(
+            exchange_order.get("cummulativeQuoteQty", 0)
+        )
+        avg_price = (
+            cumulative_quote / executed_qty if executed_qty > 0 else None
+        )
+        raw_price = exchange_order.get("price")
+        price = float(raw_price) if raw_price not in (None, "", "0", 0) else None
+
+        return BrokerOrder(
+            order_id=str(exchange_order.get("orderId", "")),
+            client_order_id=exchange_order.get("clientOrderId", ""),
+            symbol=str(Symbol(internal_symbol)),
+            side=side,
+            order_type=order_type,
+            quantity=float(exchange_order.get("origQty", 0)),
+            price=price,
+            status=status,
+            executed_quantity=executed_qty,
+            cummulative_quote_qty=cumulative_quote,
+            avg_price=avg_price,
+            exchange_response=exchange_order,
+        )
+
+    @staticmethod
+    def _map_status(raw_status: str) -> OrderStatus | None:
+        return {
+            "NEW": OrderStatus.ACCEPTED,
+            "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+            "FILLED": OrderStatus.FILLED,
+            "CANCELED": OrderStatus.CANCELLED,
+            "REJECTED": OrderStatus.REJECTED,
+            "EXPIRED": OrderStatus.EXPIRED,
+        }.get(raw_status)
 
     def _reconstruct_positions_from_binance(
-        self, symbol: str, account_info: dict, trades: list[dict],
+        self,
+        symbol: str,
+        account_info: dict,
+        trades: list[dict],
     ) -> None:
-        """Reconstruct local positions from Binance account balances and trades.
+        """Rebuild one spot position from complete chronological trade history.
 
-        This is the authoritative source for Testnet position state.
+        The account balance and the trade ledger must agree. Any unexplained
+        balance, deposit, withdrawal, incomplete history, or cross-pair asset
+        usage causes reconciliation to fail closed instead of inventing a cost
+        basis.
         """
-        from datetime import datetime
-
-        norm_symbol = symbol.replace("/", "").replace("-", "")
-
-        # Parse account balances
-        balances = account_info.get("balances", [])
-        base_asset = ""
-        quote_asset = ""
-        for common_quote in ["USDT", "USDC", "BUSD", "BTC", "ETH"]:
-            if norm_symbol.endswith(common_quote):
-                base_asset = norm_symbol[:-len(common_quote)]
-                quote_asset = common_quote
-                break
-
-        if not base_asset:
-            return
-
-        base_balance = 0.0
-        for b in balances:
-            if b.get("asset") == base_asset:
-                base_balance = float(b.get("free", 0)) + float(b.get("locked", 0))
-                break
-
-        # Calculate average entry from recent fills
-        total_cost = 0.0
-        total_qty = 0.0
-        total_commission = 0.0
-        for trade in trades:
-            if trade.get("symbol") in (norm_symbol, symbol):
-                qty = float(trade.get("qty", 0))
-                price = float(trade.get("price", 0))
-                commission = float(trade.get("commission", 0))
-                total_cost += qty * price
-                total_qty += qty
-                total_commission += commission
-
-                # Persist fills
-                fill = Fill(
-                    fill_id=str(trade.get("id", "")),
-                    order_id=str(trade.get("orderId", "")),
-                    client_order_id=trade.get("clientOrderId", ""),
-                    symbol=symbol,
-                    side=OrderSide.BUY if trade.get("isBuyer") else OrderSide.SELL,
-                    quantity=qty,
-                    price=price,
-                    commission=commission,
-                    commission_asset=trade.get("commissionAsset", ""),
-                    filled_at=datetime.utcfromtimestamp(
-                        trade.get("time", 0) / 1000.0
-                    ),
-                )
-                self._repo.insert_fill(fill)
-
-        # Upsert position
-        if abs(base_balance) > 1e-10:
-            avg_price = total_cost / total_qty if total_qty > 0 else 0.0
-            position = Position(
-                symbol=symbol,
-                quantity=base_balance,
-                avg_entry_price=avg_price,
-                total_commission=total_commission,
+        internal_symbol = str(Symbol(symbol))
+        exchange_symbol = internal_symbol.replace("-", "")
+        base_asset, quote_asset = self._split_symbol(exchange_symbol)
+        account_quantity = self._account_balance(account_info, base_asset)
+        relevant_trades = [
+            trade
+            for trade in trades
+            if trade.get("symbol") in {exchange_symbol, internal_symbol}
+        ]
+        relevant_trades.sort(
+            key=lambda trade: (
+                int(trade.get("time", 0)),
+                int(trade.get("id", 0)),
             )
-            self._repo.upsert_position(position)
+        )
+
+        inventory_qty = 0.0
+        average_cost = 0.0
+        realized_pnl = 0.0
+        commission_quote = 0.0
+
+        for trade in relevant_trades:
+            qty = float(trade.get("qty", 0))
+            price = float(trade.get("price", 0))
+            quote_qty = float(trade.get("quoteQty", qty * price))
+            commission = float(trade.get("commission", 0))
+            commission_asset = trade.get("commissionAsset", "")
+            is_buyer = bool(trade.get("isBuyer"))
+
+            if qty <= 0 or price <= 0:
+                raise PositionReconstructionError(
+                    f"Invalid trade payload for {internal_symbol}: {trade}"
+                )
+
+            if commission_asset == quote_asset:
+                commission_quote += commission
+            elif commission_asset == base_asset:
+                commission_quote += commission * price
+
+            if is_buyer:
+                acquired_qty = qty
+                acquisition_cost = quote_qty
+                if commission_asset == base_asset:
+                    acquired_qty -= commission
+                elif commission_asset == quote_asset:
+                    acquisition_cost += commission
+
+                if acquired_qty <= 0:
+                    raise PositionReconstructionError(
+                        f"Buy commission consumes full quantity for "
+                        f"{internal_symbol}"
+                    )
+                new_qty = inventory_qty + acquired_qty
+                average_cost = (
+                    inventory_qty * average_cost + acquisition_cost
+                ) / new_qty
+                inventory_qty = new_qty
+            else:
+                disposed_qty = qty
+                if commission_asset == base_asset:
+                    disposed_qty += commission
+
+                tolerance = max(1e-10, abs(inventory_qty) * 1e-9)
+                if disposed_qty > inventory_qty + tolerance:
+                    raise PositionReconstructionError(
+                        f"Trade history for {internal_symbol} sells "
+                        f"{disposed_qty} but only {inventory_qty} is explained"
+                    )
+
+                quote_commission = (
+                    commission if commission_asset == quote_asset else 0.0
+                )
+                realized_pnl += qty * (price - average_cost) - quote_commission
+                inventory_qty = max(0.0, inventory_qty - disposed_qty)
+                if inventory_qty <= tolerance:
+                    inventory_qty = 0.0
+                    average_cost = 0.0
+
+            fill = Fill(
+                fill_id=f"{exchange_symbol}:{trade.get('id', '')}",
+                order_id=str(trade.get("orderId", "")),
+                client_order_id=trade.get("clientOrderId", ""),
+                symbol=internal_symbol,
+                side=OrderSide.BUY if is_buyer else OrderSide.SELL,
+                quantity=qty,
+                price=price,
+                commission=commission,
+                commission_asset=commission_asset,
+                filled_at=datetime.utcfromtimestamp(
+                    float(trade.get("time", 0)) / 1000.0
+                ),
+            )
+            self._repo.insert_fill(fill)
+
+        tolerance = max(1e-8, abs(account_quantity) * 1e-6)
+        if abs(inventory_qty - account_quantity) > tolerance:
+            raise PositionReconstructionError(
+                f"Trade history explains {inventory_qty} {base_asset}, but "
+                f"account reports {account_quantity}; refusing unknown cost basis"
+            )
+
+        existing = self._repo.get_position(internal_symbol)
+        position = Position(
+            symbol=internal_symbol,
+            quantity=account_quantity if account_quantity > tolerance else 0.0,
+            avg_entry_price=(average_cost if account_quantity > tolerance else 0.0),
+            realized_pnl=realized_pnl,
+            total_commission=commission_quote,
+            opened_at=(existing.opened_at if existing else datetime.utcnow()),
+        )
+        self._repo.upsert_position(position)
+
+    @staticmethod
+    def _account_balance(account_info: dict, asset: str) -> float:
+        for balance in account_info.get("balances", []):
+            if balance.get("asset") == asset:
+                return float(balance.get("free", 0)) + float(
+                    balance.get("locked", 0)
+                )
+        return 0.0
+
+    @staticmethod
+    def _split_symbol(exchange_symbol: str) -> tuple[str, str]:
+        for quote in ("USDT", "USDC", "BUSD", "TUSD", "DAI", "BTC", "ETH"):
+            if exchange_symbol.endswith(quote) and len(exchange_symbol) > len(quote):
+                return exchange_symbol[: -len(quote)], quote
+        raise PositionReconstructionError(
+            f"Cannot determine base/quote assets for {exchange_symbol}"
+        )
