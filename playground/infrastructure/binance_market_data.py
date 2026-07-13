@@ -60,23 +60,31 @@ class BinanceMarketDataAdapter:
     def fetch_historical_candles(
         self, symbol: str, timeframe: str, limit: int | None = None
     ) -> list[Candle]:
-        """Fetch the most recent `limit` completed candles."""
+        """Fetch the most recent `limit` completed candles.
+
+        The currently-forming (incomplete) candle is always excluded.
+        """
         limit = limit or self._market.historical_candle_limit
-        raw = self._get_klines(symbol, timeframe, limit=min(limit, self.MAX_LIMIT))
-        return [self._parse_kline(k, symbol, timeframe, CandleSource.HISTORICAL) for k in raw]
+        raw = self._get_klines(symbol, timeframe, limit=min(limit + 1, self.MAX_LIMIT))
+        candles = [self._parse_kline(k, symbol, timeframe, CandleSource.HISTORICAL) for k in raw]
+        return self._strip_forming_candle(candles)
 
     def fetch_candles_since(
         self, symbol: str, timeframe: str, start_time: datetime,
         limit: int | None = None,
     ) -> list[Candle]:
-        """Fetch candles from start_time up to now."""
+        """Fetch candles from start_time up to now.
+
+        The currently-forming (incomplete) candle is always excluded.
+        """
         limit = limit or self._market.historical_candle_limit
         raw = self._get_klines(
             symbol, timeframe,
             start_time_ms=int(start_time.timestamp() * 1000),
-            limit=min(limit, self.MAX_LIMIT),
+            limit=min(limit + 1, self.MAX_LIMIT),
         )
-        return [self._parse_kline(k, symbol, timeframe, CandleSource.LIVE) for k in raw]
+        candles = [self._parse_kline(k, symbol, timeframe, CandleSource.LIVE) for k in raw]
+        return self._strip_forming_candle(candles)
 
     def fetch_candles_range(
         self, symbol: str, timeframe: str,
@@ -103,6 +111,25 @@ class BinanceMarketDataAdapter:
             if c.is_complete:
                 return c
         return None
+
+    # ------------------------------------------------------------------
+    # Forming candle filter
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_forming_candle(candles: list[Candle]) -> list[Candle]:
+        """Remove the currently-forming (incomplete) candle from the list.
+
+        Binance /api/v3/klines always returns the current partial candle as
+        the last element when no endTime is provided.  That candle must not
+        enter immutable storage because its OHLCV values are not final.
+        """
+        if not candles:
+            return candles
+        last = candles[-1]
+        if last.close_time > datetime.utcnow():
+            return candles[:-1]
+        return candles
 
     # ------------------------------------------------------------------
     # Symbol normalization

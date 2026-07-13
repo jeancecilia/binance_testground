@@ -319,8 +319,10 @@ class TradingEngine:
             results = self.strategy_pipeline.evaluate(context)
 
             # Execution pipeline: risk → order submission
+            # Only pass StrategySignal instances (rejections are recorded
+            # by the strategy pipeline already).
             for strategy, result in results:
-                if hasattr(result, 'signal_id'):  # StrategySignal
+                if hasattr(result, 'signal_id') and not hasattr(result, 'reason'):
                     self.execution_pipeline.process_signal(result)
 
             return context
@@ -375,6 +377,11 @@ def main() -> None:
     # Override log level
     object.__setattr__(config.logging, 'level', args.log_level)
 
+    # Wire --dataset into replay config
+    if args.dataset:
+        object.__setattr__(config.replay, 'dataset_path', args.dataset)
+        object.__setattr__(config.replay, 'dataset_identifier', args.dataset)
+
     # Validate
     errors = config.validate()
     if errors:
@@ -409,6 +416,8 @@ def main() -> None:
             market_source=market_source,
             broker=broker,
         )
+        # Connect simulated broker to execution pipeline for replay
+        engine.execution_pipeline._broker = broker
 
     elif mode == RuntimeMode.SHADOW:
         clock = SystemClock()

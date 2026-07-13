@@ -22,6 +22,7 @@ from playground.domain.orders import RiskDecision
 from playground.domain.positions import Position
 from playground.domain.signals import SignalRejectionReason, StrategySignal
 from playground.infrastructure.configuration import RiskEngineConfig
+from playground.infrastructure.system_clock import Clock, SystemClock
 
 
 class RiskEngine:
@@ -36,12 +37,14 @@ class RiskEngine:
         positions: Dict[str, Position] | None = None,
         daily_pnl: float = 0.0,
         active_signal_ids: set[str] | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self.config = config or RiskEngineConfig()
         self._positions: Dict[str, Position] = positions or {}
         self._daily_pnl = daily_pnl
         self._last_entry_time: Dict[str, datetime] = {}
         self._active_signal_ids: set[str] = active_signal_ids or set()
+        self._clock = clock or SystemClock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -102,15 +105,23 @@ class RiskEngine:
             )
         checks_passed.append("positions_per_symbol_ok")
 
-        # 5. Max exposure per symbol
-        symbol_exposure = sum(
-            p.notional_value for s, p in self._positions.items()
-            if p.is_open and s == signal.symbol
+        # 5. Max exposure per symbol (include proposed position)
+        proposed_notional = (
+            signal.entry_price * self._calculate_position_size(current_price)
+            if signal.entry_price and current_price > 0
+            else 0.0
+        )
+        symbol_exposure = (
+            sum(
+                p.notional_value for s, p in self._positions.items()
+                if p.is_open and s == signal.symbol
+            )
+            + proposed_notional
         )
         max_symbol_exposure = (
             self.config.initial_balance_usdt * self.config.max_exposure_per_symbol_pct
         )
-        if symbol_exposure >= max_symbol_exposure:
+        if symbol_exposure > max_symbol_exposure:
             checks_failed.append("max_exposure_per_symbol")
             return self._make_decision(
                 signal, False, checks_passed, checks_failed,
@@ -118,14 +129,15 @@ class RiskEngine:
             )
         checks_passed.append("exposure_per_symbol_ok")
 
-        # 6. Max total exposure
-        total_exposure = sum(
-            p.notional_value for p in self._positions.values() if p.is_open
+        # 6. Max total exposure (include proposed position)
+        total_exposure = (
+            sum(p.notional_value for p in self._positions.values() if p.is_open)
+            + proposed_notional
         )
         max_total_exposure = (
             self.config.initial_balance_usdt * self.config.max_total_exposure_pct
         )
-        if total_exposure >= max_total_exposure:
+        if total_exposure > max_total_exposure:
             checks_failed.append("max_total_exposure")
             return self._make_decision(
                 signal, False, checks_passed, checks_failed,
@@ -133,10 +145,11 @@ class RiskEngine:
             )
         checks_passed.append("total_exposure_ok")
 
-        # 7. Max daily loss
-        if abs(self._daily_pnl) >= (
+        # 7. Max daily loss (only actual losses block trading)
+        max_daily_loss = (
             self.config.initial_balance_usdt * self.config.max_daily_loss_pct
-        ):
+        )
+        if self._daily_pnl < 0 and abs(self._daily_pnl) >= max_daily_loss:
             checks_failed.append("max_daily_loss")
             return self._make_decision(
                 signal, False, checks_passed, checks_failed,
@@ -156,11 +169,11 @@ class RiskEngine:
                 )
         checks_passed.append("drawdown_ok")
 
-        # 9. Entry cooldown
+        # 9. Entry cooldown (uses injected clock for determinism)
         cooldown_key = f"{signal.strategy_id}:{signal.symbol}"
         last_entry = self._last_entry_time.get(cooldown_key)
         if last_entry is not None:
-            elapsed = (datetime.utcnow() - last_entry).total_seconds()
+            elapsed = (self._clock.now() - last_entry).total_seconds()
             if elapsed < self.config.entry_cooldown_seconds:
                 checks_failed.append("entry_cooldown")
                 return self._make_decision(
@@ -208,7 +221,7 @@ class RiskEngine:
 
         # All checks passed
         self._active_signal_ids.add(str(signal.signal_id))
-        self._last_entry_time[cooldown_key] = datetime.utcnow()
+        self._last_entry_time[cooldown_key] = self._clock.now()
 
         return RiskDecision(
             signal_id=str(signal.signal_id),

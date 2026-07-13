@@ -137,11 +137,32 @@ class ExecutionPipeline:
             client_order_id=str(signal.signal_id),  # Deterministic ID
         )
 
+        # Persist PENDING intent BEFORE transmission (protects against
+        # connection drops where Binance receives the order but we never
+        # see the response).
+        pending_order = BrokerOrder(
+            order_id="",
+            client_order_id=order_request.client_order_id,
+            symbol=order_request.symbol,
+            side=order_request.side,
+            order_type=order_request.order_type,
+            quantity=order_request.quantity,
+            price=order_request.price,
+            status=OrderStatus.PENDING,
+        )
+        self._repo.insert_order(pending_order)
+
         # Submit to broker
         broker_order = self._broker.submit_order(order_request)
 
-        # Persist the broker order
-        self._repo.insert_order(broker_order)
+        # Update with broker response
+        self._repo.update_order_status(
+            broker_order.client_order_id,
+            broker_order.status,
+            broker_order.executed_quantity,
+            broker_order.avg_price,
+            broker_order.exchange_response,
+        )
 
         logger.info(
             "Order submitted to Testnet", extra={

@@ -42,13 +42,17 @@ class StrategyPipeline:
 
         Returns list of (strategy, result) pairs.
         Each result is either a StrategySignal or SignalRejection.
+        Duplicate signals are replaced with rejections so callers
+        never receive an executable signal that already exists.
         """
-        results = self._registry.evaluate_all(context)
+        raw_results = self._registry.evaluate_all(context)
+        clean_results: List[Tuple[Strategy, StrategySignal | SignalRejection]] = []
 
-        for strategy, result in results:
-            self._record_evaluation(strategy, context, result)
+        for strategy, result in raw_results:
+            cleaned = self._record_evaluation(strategy, context, result)
+            clean_results.append((strategy, cleaned))
 
-        return results
+        return clean_results
 
     def evaluate_single(
         self, strategy_id: str, context: MarketContext,
@@ -78,8 +82,12 @@ class StrategyPipeline:
     def _record_evaluation(
         self, strategy: Strategy, context: MarketContext,
         result: StrategySignal | SignalRejection,
-    ) -> None:
-        """Record every strategy evaluation in the database."""
+    ) -> StrategySignal | SignalRejection:
+        """Record every strategy evaluation in the database.
+
+        Returns the result after idempotency checking. If the signal already
+        exists in the database, a SignalRejection is returned instead.
+        """
         meta = strategy.meta
         is_signal = isinstance(result, StrategySignal)
 
@@ -118,7 +126,7 @@ class StrategyPipeline:
                     rejection_reason=SignalRejectionReason.DUPLICATE_SIGNAL.value,
                     detail=dup_rejection.detail,
                 )
-                return
+                return dup_rejection
 
             # New signal — persist it
             self._repo.insert_signal(signal)
@@ -144,6 +152,7 @@ class StrategyPipeline:
                     "score": signal.score,
                 }
             )
+            return signal
         else:
             rejection: SignalRejection = result
             self._repo.insert_signal_rejection(rejection)
@@ -169,3 +178,4 @@ class StrategyPipeline:
                     "detail": rejection.detail,
                 }
             )
+            return rejection
