@@ -129,6 +129,7 @@ class TradingEngine:
             risk_engine=self.risk_engine,
             broker=broker,  # Broker ABC — SimulatedBroker or BinanceTestnetBroker
             mode=config.mode,
+            clock=clock,
         )
 
         self.coordinator = CandleCoordinator(
@@ -322,12 +323,19 @@ class TradingEngine:
             # Strategy pipeline: evaluate strategies
             results = self.strategy_pipeline.evaluate(context)
 
+            # Build synthetic order-book snapshot for liquidity checks
+            order_book = self._build_synthetic_order_book(symbol, candle)
+
             # Execution pipeline: risk → order submission
-            # Only pass StrategySignal instances (rejections are recorded
-            # by the strategy pipeline already).
+            current_price = candle.close
             for strategy, result in results:
                 if hasattr(result, 'signal_id') and not hasattr(result, 'reason'):
-                    self.execution_pipeline.process_signal(result)
+                    decision = self.execution_pipeline.process_signal(
+                        result, order_book=order_book, current_price=current_price,
+                    )
+                    # Update risk engine with position state after execution
+                    if decision and decision.approved and self.broker is not None:
+                        self._sync_positions_to_risk_engine()
 
             return context
 
@@ -337,6 +345,47 @@ class TradingEngine:
                 f"candle {candle.open_time}: {e}"
             )
             return None
+
+    def _build_synthetic_order_book(self, symbol: str, candle):
+        """Build a synthetic order book from candle data for liquidity checks.
+
+        Uses the candle's high/low/close to estimate bid/ask levels.
+        This provides reasonable depth for replay and shadow modes.
+        """
+        from playground.domain.market import Symbol, OrderBookSnapshot
+        mid = candle.close
+        spread = max(mid * 0.0005, 0.01)  # 0.05% minimum spread
+        best_bid = mid - spread / 2
+        best_ask = mid + spread / 2
+
+        # Build 5 levels of synthetic depth
+        bids = tuple(
+            (best_bid - i * spread * 0.5, candle.volume * 0.2)
+            for i in range(5)
+        )
+        asks = tuple(
+            (best_ask + i * spread * 0.5, candle.volume * 0.2)
+            for i in range(5)
+        )
+        return OrderBookSnapshot(
+            symbol=Symbol(symbol),
+            timestamp=candle.close_time,
+            bids=bids,
+            asks=asks,
+        )
+
+    def _sync_positions_to_risk_engine(self):
+        """Sync broker positions into the risk engine after execution."""
+        if self.broker is None:
+            return
+        positions = {}
+        if hasattr(self.broker, 'get_all_positions'):
+            from playground.replay.simulated_broker import SimulatedBroker
+            if isinstance(self.broker, SimulatedBroker):
+                for sym, pos in self.broker.get_all_positions().items():
+                    positions[sym] = pos
+        if positions:
+            self.risk_engine.update_positions(positions)
 
 
 # ------------------------------------------------------------------

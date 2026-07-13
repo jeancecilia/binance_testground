@@ -40,11 +40,13 @@ class ExecutionPipeline:
         risk_engine: RiskEngine,
         broker: Broker | None = None,
         mode: RuntimeMode = RuntimeMode.SHADOW,
+        clock = None,
     ) -> None:
         self._repo = repository
         self._risk = risk_engine
         self._broker = broker
         self._mode = mode
+        self._clock = clock
 
     # ------------------------------------------------------------------
     # Public API
@@ -88,8 +90,9 @@ class ExecutionPipeline:
 
         # Estimate freshness/liquidity metrics
         spread_pct = order_book.spread_pct if order_book else 0.0
+        # BUY orders consume asks; use ask depth for liquidity validation
         depth = (
-            order_book.depth_at_bid(5) * order_book.mid_price
+            order_book.depth_at_ask(5) * order_book.mid_price
             if order_book else 0.0
         )
         slippage = self._estimate_slippage(order_book)
@@ -236,10 +239,10 @@ class ExecutionPipeline:
     ) -> Optional[SignalRejectionReason]:
         """Validate market freshness for a signal.
 
+        Uses the injected clock so replay determinism is preserved.
         Returns None if fresh, or a rejection reason if stale.
         """
-        # Candle freshness: signal candle must not be too old
-        now = datetime.utcnow()
+        now = self._clock.now() if self._clock else datetime.utcnow()
         candle_age_seconds = (now - signal.candle_timestamp).total_seconds()
 
         max_age_map = {

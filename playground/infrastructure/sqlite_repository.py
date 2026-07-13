@@ -672,7 +672,7 @@ class SQLiteRepository:
 
     def get_open_orders(self) -> list[BrokerOrder]:
         rows = self.conn.execute(
-            "SELECT * FROM orders WHERE status IN ('PENDING','SUBMITTED','ACCEPTED','PARTIALLY_FILLED')"
+            "SELECT * FROM orders WHERE status IN ('PENDING','SUBMITTED','ACCEPTED','PARTIALLY_FILLED','UNKNOWN','PENDING_RECONCILIATION')"
         ).fetchall()
         return [self._row_to_order(r) for r in rows]
 

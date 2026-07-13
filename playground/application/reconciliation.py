@@ -198,17 +198,23 @@ class ReconciliationEngine:
 
         for mismatch in mismatches:
             if "not found on exchange" in mismatch:
-                # Local order for a PENDING/SUBMITTED order not on exchange
-                # This could mean it was never submitted — mark as UNKNOWN
+                # Local order not on exchange — mark as UNKNOWN
                 cid = mismatch.split(" ")[2]
+                existing = self._repo.get_order(cid)
                 self._repo.update_order_status(
-                    cid, OrderStatus.UNKNOWN, 0.0, None,
+                    cid,
+                    existing.order_id if existing else "",
+                    OrderStatus.UNKNOWN,
+                    existing.executed_quantity if existing else 0.0,
+                    existing.cummulative_quote_qty if existing else 0.0,
+                    existing.avg_price,
+                    existing.price,
                     {"reconciliation_note": "Order not found on exchange during reconciliation"},
                 )
                 repairs.append(f"Marked local order {cid} as UNKNOWN (not on exchange)")
 
             elif "not found locally" in mismatch:
-                # Exchange has an order we don't know about — create it
+                # Exchange has an order we don't know about
                 cid = mismatch.split(" ")[2]
                 exch_order = None
                 for eo in exchange_recent + exchange_open:
@@ -229,21 +235,36 @@ class ReconciliationEngine:
                     }
                     status = status_map.get(exch_order.get("status", ""), OrderStatus.UNKNOWN)
 
-                    broker_order = BrokerOrder(
-                        order_id=str(exch_order.get("orderId", "")),
-                        client_order_id=cid,
-                        symbol=exch_order.get("symbol", ""),
-                        side=side,
-                        order_type=order_type,
-                        quantity=float(exch_order.get("origQty", 0)),
-                        price=float(exch_order.get("price", 0)) if exch_order.get("price") else None,
-                        status=status,
-                        executed_quantity=float(exch_order.get("executedQty", 0)),
-                        cummulative_quote_qty=float(exch_order.get("cummulativeQuoteQty", 0)),
-                        exchange_response=exch_order,
-                    )
-                    self._repo.insert_order(broker_order)
-                    repairs.append(f"Created local order {cid} from exchange data")
+                    # Use upsert: update if local order exists (e.g. UNKNOWN), insert otherwise
+                    existing = self._repo.get_order(cid)
+                    if existing:
+                        self._repo.update_order_status(
+                            cid,
+                            str(exch_order.get("orderId", "")),
+                            status,
+                            float(exch_order.get("executedQty", 0)),
+                            float(exch_order.get("cummulativeQuoteQty", 0)),
+                            float(exch_order.get("price", 0)) if exch_order.get("price") else None,
+                            float(exch_order.get("price", 0)) if exch_order.get("price") else None,
+                            exch_order,
+                        )
+                        repairs.append(f"Updated local order {cid} from exchange data (was {existing.status.value})")
+                    else:
+                        broker_order = BrokerOrder(
+                            order_id=str(exch_order.get("orderId", "")),
+                            client_order_id=cid,
+                            symbol=exch_order.get("symbol", ""),
+                            side=side,
+                            order_type=order_type,
+                            quantity=float(exch_order.get("origQty", 0)),
+                            price=float(exch_order.get("price", 0)) if exch_order.get("price") else None,
+                            status=status,
+                            executed_quantity=float(exch_order.get("executedQty", 0)),
+                            cummulative_quote_qty=float(exch_order.get("cummulativeQuoteQty", 0)),
+                            exchange_response=exch_order,
+                        )
+                        self._repo.insert_order(broker_order)
+                        repairs.append(f"Created local order {cid} from exchange data")
 
             elif "Status mismatch" in mismatch:
                 # Update local status to match exchange
@@ -268,8 +289,12 @@ class ReconciliationEngine:
                         break
 
                 self._repo.update_order_status(
-                    cid, new_status,
+                    cid,
+                    str(exch_data.get("orderId", "")),
+                    new_status,
                     float(exch_data.get("executedQty", 0)),
+                    float(exch_data.get("cummulativeQuoteQty", 0)),
+                    float(exch_data.get("price", 0)) if exch_data.get("price") else None,
                     float(exch_data.get("price", 0)) if exch_data.get("price") else None,
                     exch_data,
                 )
