@@ -72,8 +72,7 @@ class StrategyPipeline:
             return None
 
         result = strategy.evaluate(context)
-        self._record_evaluation(strategy, context, result)
-        return result
+        return self._record_evaluation(strategy, context, result)
 
     # ------------------------------------------------------------------
     # Recording

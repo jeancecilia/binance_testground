@@ -101,12 +101,14 @@ class BinanceTestnetBroker:
     # Order submission
     # ------------------------------------------------------------------
 
-    def submit_order(self, order: OrderRequest) -> BrokerOrder:
+    def submit_order(self, order: OrderRequest, current_price: float = 0.0) -> BrokerOrder:
         """Submit an order to Binance Testnet.
 
         Requires prior validate_endpoint() call.
-        Persists the order intent as a BrokerOrder in PENDING state.
+        current_price is accepted for the Broker ABC but ignored (Binance
+        fills at market price).
         """
+        _ = current_price  # accepted for ABC compatibility, unused
         if not self._validated:
             raise BinanceTestnetBrokerError(
                 "Broker not validated. Call validate_endpoint() first."
@@ -144,6 +146,7 @@ class BinanceTestnetBroker:
             return self._parse_order_response(response, broker_order)
 
         except HTTPError as e:
+            # HTTP errors from Binance (4xx = our fault, 5xx = their fault)
             error_body = ""
             try:
                 error_body = e.read().decode()
@@ -151,22 +154,13 @@ class BinanceTestnetBroker:
                 pass
 
             safe_body = self._redact(error_body)
-            broker_order = BrokerOrder(
-                order_id=broker_order.order_id,
-                client_order_id=broker_order.client_order_id,
-                symbol=broker_order.symbol,
-                side=broker_order.side,
-                order_type=broker_order.order_type,
-                quantity=broker_order.quantity,
-                price=broker_order.price,
-                status=OrderStatus.REJECTED,
-                exchange_response={"error_code": e.code, "error_body": safe_body},
-                created_at=broker_order.created_at,
-                updated_at=datetime.utcnow(),
-            )
-            return broker_order
+            if e.code >= 500 or e.code == 429:
+                # Server error or rate limit — order status is UNKNOWN
+                status = OrderStatus.UNKNOWN
+            else:
+                # Client error (4xx except 429) — genuinely rejected
+                status = OrderStatus.REJECTED
 
-        except URLError as e:
             return BrokerOrder(
                 order_id=broker_order.order_id,
                 client_order_id=broker_order.client_order_id,
@@ -175,7 +169,23 @@ class BinanceTestnetBroker:
                 order_type=broker_order.order_type,
                 quantity=broker_order.quantity,
                 price=broker_order.price,
-                status=OrderStatus.REJECTED,
+                status=status,
+                exchange_response={"error_code": e.code, "error_body": safe_body},
+                created_at=broker_order.created_at,
+                updated_at=datetime.utcnow(),
+            )
+
+        except URLError as e:
+            # Network interruption — we don't know if Binance received the order
+            return BrokerOrder(
+                order_id=broker_order.order_id,
+                client_order_id=broker_order.client_order_id,
+                symbol=broker_order.symbol,
+                side=broker_order.side,
+                order_type=broker_order.order_type,
+                quantity=broker_order.quantity,
+                price=broker_order.price,
+                status=OrderStatus.UNKNOWN,
                 exchange_response={"network_error": str(e.reason)},
                 created_at=broker_order.created_at,
                 updated_at=datetime.utcnow(),

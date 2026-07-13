@@ -2,6 +2,7 @@
 
 Handles freshness/liquidity validation and order submission.
 In shadow mode, signals are recorded but orders are NOT submitted.
+Supports both SimulatedBroker (replay) and BinanceTestnetBroker (testnet).
 """
 
 from __future__ import annotations
@@ -12,15 +13,14 @@ from typing import Optional
 
 from playground.domain.market import OrderBookSnapshot
 from playground.domain.orders import (
-    BrokerOrder, OrderRequest, OrderSide, OrderStatus, OrderType, RiskDecision,
-    TimeInForce,
+    Broker, BrokerOrder, OrderRequest, OrderSide, OrderStatus, OrderType,
+    RiskDecision, TimeInForce,
 )
 from playground.domain.positions import Position
 from playground.domain.signals import (
     SignalRejectionReason, StrategySignal,
 )
 from playground.core.risk_engine import RiskEngine
-from playground.infrastructure.binance_testnet_broker import BinanceTestnetBroker
 from playground.infrastructure.configuration import RuntimeMode
 from playground.infrastructure.sqlite_repository import SQLiteRepository
 
@@ -31,14 +31,14 @@ class ExecutionPipeline:
     """Routes signals through risk → freshness → execution.
 
     In shadow mode: evaluates risk but does NOT submit orders.
-    In testnet mode: evaluates risk and submits approved orders.
+    In testnet/replay mode: evaluates risk and submits approved orders.
     """
 
     def __init__(
         self,
         repository: SQLiteRepository,
         risk_engine: RiskEngine,
-        broker: BinanceTestnetBroker | None = None,
+        broker: Broker | None = None,
         mode: RuntimeMode = RuntimeMode.SHADOW,
     ) -> None:
         self._repo = repository
@@ -53,13 +53,39 @@ class ExecutionPipeline:
     def process_signal(
         self, signal: StrategySignal,
         order_book: OrderBookSnapshot | None = None,
+        current_price: float | None = None,
     ) -> Optional[RiskDecision]:
         """Process a strategy signal through risk and freshness validation.
 
+        Args:
+            signal: The strategy signal to process.
+            order_book: Optional order book for liquidity/spread checks.
+            current_price: Current market price (required for replay broker).
+
         Returns RiskDecision (approved or rejected).
         In shadow mode, stops after risk decision.
-        In testnet mode, submits approved orders to the broker.
+        In testnet/replay mode, submits approved orders to the broker.
         """
+        # Validate freshness before risk evaluation
+        freshness_rejection = self.validate_freshness(signal, order_book)
+        if freshness_rejection is not None:
+            decision = RiskDecision(
+                signal_id=str(signal.signal_id),
+                strategy_id=signal.strategy_id,
+                symbol=signal.symbol,
+                timeframe=signal.timeframe,
+                candle_timestamp=signal.candle_timestamp,
+                approved=False,
+                rejection_reason=freshness_rejection.value,
+                checks_failed=(freshness_rejection.value,),
+            )
+            self._repo.insert_risk_decision(decision)
+            logger.info("Freshness rejected", extra={
+                "signal_id": str(signal.signal_id),
+                "reason": freshness_rejection.value,
+            })
+            return decision
+
         # Estimate freshness/liquidity metrics
         spread_pct = order_book.spread_pct if order_book else 0.0
         depth = (
@@ -101,22 +127,22 @@ class ExecutionPipeline:
         if self._mode == RuntimeMode.SHADOW:
             return decision
 
-        # In testnet mode, submit the order
-        if self._mode == RuntimeMode.TESTNET and self._broker is not None:
-            return self._submit_order(signal, decision)
+        # Submit the order (replay or testnet)
+        if self._broker is not None:
+            return self._submit_order(signal, decision, current_price or signal.entry_price or 0.0)
 
         return decision
 
     # ------------------------------------------------------------------
-    # Order submission (Testnet only)
+    # Order submission (Testnet / Replay)
     # ------------------------------------------------------------------
 
     def _submit_order(
-        self, signal: StrategySignal, decision: RiskDecision,
+        self, signal: StrategySignal, decision: RiskDecision, current_price: float,
     ) -> RiskDecision:
-        """Submit an approved order to the Testnet broker."""
+        """Submit an approved order through the broker."""
         if self._broker is None:
-            logger.error("Broker not configured for Testnet execution")
+            logger.error("Broker not configured for execution")
             return decision
 
         if decision.position_size is None or decision.position_size <= 0:
@@ -134,12 +160,10 @@ class ExecutionPipeline:
             side=OrderSide.BUY,
             order_type=OrderType.MARKET,
             quantity=decision.position_size,
-            client_order_id=str(signal.signal_id),  # Deterministic ID
+            client_order_id=str(signal.signal_id),
         )
 
-        # Persist PENDING intent BEFORE transmission (protects against
-        # connection drops where Binance receives the order but we never
-        # see the response).
+        # Persist PENDING intent BEFORE transmission
         pending_order = BrokerOrder(
             order_id="",
             client_order_id=order_request.client_order_id,
@@ -150,22 +174,49 @@ class ExecutionPipeline:
             price=order_request.price,
             status=OrderStatus.PENDING,
         )
-        self._repo.insert_order(pending_order)
+        inserted = self._repo.insert_order(pending_order)
+        if not inserted:
+            logger.error(
+                "Duplicate order blocked — client_order_id already exists", extra={
+                    "client_order_id": order_request.client_order_id,
+                }
+            )
+            return RiskDecision(
+                signal_id=str(signal.signal_id),
+                strategy_id=signal.strategy_id,
+                symbol=signal.symbol,
+                timeframe=signal.timeframe,
+                candle_timestamp=signal.candle_timestamp,
+                approved=False,
+                rejection_reason=SignalRejectionReason.DUPLICATE_SIGNAL.value,
+                checks_failed=("duplicate_order",),
+            )
 
-        # Submit to broker
-        broker_order = self._broker.submit_order(order_request)
+        # Submit to broker (shared interface)
+        broker_order = self._broker.submit_order(order_request, current_price)
 
-        # Update with broker response
+        # Update with broker response (now includes order_id, cumm_quote_qty, price)
         self._repo.update_order_status(
             broker_order.client_order_id,
+            broker_order.order_id,
             broker_order.status,
             broker_order.executed_quantity,
+            broker_order.cummulative_quote_qty,
             broker_order.avg_price,
+            broker_order.price,
             broker_order.exchange_response,
         )
 
+        if broker_order.status == OrderStatus.UNKNOWN:
+            logger.warning(
+                "Order status UNKNOWN after submission — blocking further orders until reconciliation",
+                extra={"client_order_id": broker_order.client_order_id},
+            )
+            # Engage kill switch until reconciliation resolves
+            self._risk.engage_kill_switch()
+
         logger.info(
-            "Order submitted to Testnet", extra={
+            "Order submitted", extra={
                 "client_order_id": broker_order.client_order_id,
                 "exchange_order_id": broker_order.order_id,
                 "status": broker_order.status.value,
@@ -191,7 +242,6 @@ class ExecutionPipeline:
         now = datetime.utcnow()
         candle_age_seconds = (now - signal.candle_timestamp).total_seconds()
 
-        # A 1h candle is valid for up to 1.5x its period
         max_age_map = {
             "15m": 15 * 60 * 1.5,
             "1h": 60 * 60 * 1.5,
@@ -206,7 +256,7 @@ class ExecutionPipeline:
         # Order book freshness
         if order_book is not None:
             ob_age = (now - order_book.timestamp).total_seconds()
-            if ob_age > 60:  # Order book older than 60 seconds
+            if ob_age > 60:
                 return SignalRejectionReason.ORDER_BOOK_STALE
 
         return None

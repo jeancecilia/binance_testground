@@ -642,16 +642,19 @@ class SQLiteRepository:
             return False
 
     def update_order_status(
-        self, client_order_id: str, status: OrderStatus,
-        executed_qty: float, avg_price: Optional[float],
+        self, client_order_id: str, order_id: str, status: OrderStatus,
+        executed_qty: float, cumm_quote_qty: float,
+        avg_price: Optional[float], price: Optional[float],
         exchange_response: dict,
     ) -> None:
         self.conn.execute(
-            """UPDATE orders SET status = ?, executed_quantity = ?,
-            avg_price = ?, updated_at = ?, exchange_response = ?
+            """UPDATE orders SET order_id = ?, status = ?, executed_quantity = ?,
+            cummulative_quote_qty = ?, avg_price = ?, price = ?,
+            updated_at = ?, exchange_response = ?
             WHERE client_order_id = ?""",
             (
-                status.value, executed_qty, avg_price,
+                order_id, status.value, executed_qty, cumm_quote_qty,
+                avg_price, price,
                 datetime.utcnow().isoformat(), json.dumps(exchange_response),
                 client_order_id,
             ),

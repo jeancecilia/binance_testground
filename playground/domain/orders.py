@@ -26,6 +26,7 @@ class OrderStatus(str, Enum):
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
     UNKNOWN = "UNKNOWN"
+    PENDING_RECONCILIATION = "PENDING_RECONCILIATION"
 
 
 class TimeInForce(str, Enum):
@@ -116,3 +117,23 @@ class RiskDecision:
     checks_passed: tuple[str, ...] = ()
     checks_failed: tuple[str, ...] = ()
     created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+# ------------------------------------------------------------------
+# Broker interface (ABC) — shared by SimulatedBroker and BinanceTestnetBroker
+# ------------------------------------------------------------------
+
+from abc import ABC, abstractmethod
+
+
+class Broker(ABC):
+    """Abstract broker interface for replay and Testnet execution.
+
+    Both SimulatedBroker and BinanceTestnetBroker implement this.
+    """
+
+    @abstractmethod
+    def submit_order(self, order: OrderRequest, current_price: float) -> BrokerOrder:
+        """Submit an order. SimulatedBroker uses current_price for fill;
+        BinanceTestnetBroker ignores it."""
+        ...

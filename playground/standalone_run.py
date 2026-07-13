@@ -103,8 +103,11 @@ class TradingEngine:
         self.registry = StrategyRegistry()
         self.registry.register(BNBRejectionClusterSpecialist())
 
-        # Build risk engine
-        self.risk_engine = RiskEngine()
+        # Build risk engine with real configuration and clock
+        self.risk_engine = RiskEngine(
+            config=config.risk,
+            clock=clock,
+        )
 
         # Build pipelines
         self.market_pipeline = MarketPipeline(
@@ -124,7 +127,7 @@ class TradingEngine:
         self.execution_pipeline = ExecutionPipeline(
             repository=repository,
             risk_engine=self.risk_engine,
-            broker=broker if isinstance(broker, BinanceTestnetBroker) else None,
+            broker=broker,  # Broker ABC — SimulatedBroker or BinanceTestnetBroker
             mode=config.mode,
         )
 
@@ -284,12 +287,13 @@ class TradingEngine:
                         for candle in pending:
                             context = self._process_candle_internal(sym, timeframe, candle)
 
-                            # Update checkpoint
-                            self.coordinator.update_checkpoint(
-                                self.run_id, sym, timeframe,
-                                self.config.mode.value,
-                                candle.open_time,
-                            )
+                            # Only advance checkpoint if processing succeeded
+                            if context is not None:
+                                self.coordinator.update_checkpoint(
+                                    self.run_id, sym, timeframe,
+                                    self.config.mode.value,
+                                    candle.open_time,
+                                )
 
                     except Exception as e:
                         logger.exception(
@@ -416,8 +420,6 @@ def main() -> None:
             market_source=market_source,
             broker=broker,
         )
-        # Connect simulated broker to execution pipeline for replay
-        engine.execution_pipeline._broker = broker
 
     elif mode == RuntimeMode.SHADOW:
         clock = SystemClock()
