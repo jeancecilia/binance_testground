@@ -1,0 +1,16 @@
+# Standalone Trading Engine Playground
+# Core dependencies
+
+# No external dependencies required for the core engine.
+# All market data ingestion uses Python stdlib (urllib).
+# SQLite is built into Python stdlib.
+
+# Optional: for better HTTP performance in production
+# requests>=2.28.0
+
+# Optional: for async market data
+# aiohttp>=3.8.0
+
+# Development
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
